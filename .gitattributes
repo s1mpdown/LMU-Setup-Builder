@@ -1,0 +1,6 @@
+# Never let git rewrite line endings in payload files: the base64
+# payloads corrupt if CRLF sneaks in (base64 -d rejects \r), and the
+# .svm templates are embedded byte-for-byte.
+*.b64 -text
+*.b64.part* -text
+*.svm -text
