@@ -1,0 +1,5 @@
+*.exe
+rsrc.syso
+assets/rFactor2SharedMemoryMapPlugin64.dll
+app.ico
+dist/
