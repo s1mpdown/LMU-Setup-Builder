@@ -625,6 +625,19 @@ func main() {
 				},
 			},
 			Composite{
+				Background: SolidColorBrush{Color: surface},
+				Layout:     HBox{Margins: Margins{Left: 16, Top: 0, Right: 16, Bottom: 8}, Spacing: 6},
+				Children: []Widget{
+					Label{Text: "Created by Ari —", TextColor: muted},
+					LinkLabel{
+						Text: `<a href="https://www.twitch.tv/ariazuhdi">Twitch · ariazuhdi</a>  ·  <a href="https://www.youtube.com/@ariazuhdi">YouTube · ariazuhdi</a>  ·  <a href="https://www.tiktok.com/@412i_">TikTok · 412i_</a>`,
+						OnLinkActivated: func(link *walk.LinkLabelLink) {
+							exec.Command("rundll32", "url.dll,FileProtocolHandler", link.URL()).Start()
+						},
+					},
+				},
+			},
+			Composite{
 				Background: SolidColorBrush{Color: navy},
 				Layout:     VBox{Margins: Margins{Left: 16, Top: 10, Right: 16, Bottom: 10}, Spacing: 7},
 				Children: []Widget{
@@ -745,6 +758,17 @@ func main() {
 		panic(err)
 	}
 	logLine("window created ok")
+	// The exe carries Ari's channel icon as a file resource (Explorer
+	// shows it), but walk registers its window class without an icon,
+	// so the title bar and taskbar fall back to the Windows default
+	// glyph. Pull the icon out of our own exe and set it explicitly.
+	if self, err := os.Executable(); err == nil {
+		if ico, err := walk.NewIconExtractedFromFileWithSize(self, 0, 32); err == nil {
+			mw.SetIcon(ico)
+		} else {
+			logLine("window icon set failed: " + err.Error())
+		}
+	}
 	refreshOverlayUI()
 	refreshStatus()
 	refreshTracks()
