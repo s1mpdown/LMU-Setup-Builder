@@ -5,7 +5,7 @@ import "strconv"
 // AppVersion is this build's version. CI stamps it from the repo's
 // VERSION file via -ldflags "-X main.AppVersion=x.y.z"; the default here
 // is what a local build reports.
-var AppVersion = "1.3.0"
+var AppVersion = "1.3.1"
 
 // versionMinor is the "x.y" of a version — the What's-New ack key.
 // (Built on versionParts in update.go.)
