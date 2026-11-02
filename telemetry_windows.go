@@ -99,6 +99,64 @@ func teleDir() string {
 	return filepath.Join(configDir(), "telemetry")
 }
 
+// Auto-record state (v1.3): recording starts by itself when the car
+// is rolling on track and stops in the garage. The record button is a
+// manual override — a manual stop suppresses auto-start until the car
+// next sits in the garage, so his "stop" always sticks for the stint.
+var (
+	recAutoStarted bool
+	recSuppress    bool
+	garageSince    time.Time
+	learner        outlineLearner
+)
+
+// teleToggleRecord is the record button: manual start/stop.
+func teleToggleRecord() string {
+	_, _, recording, _, _ := teleSnapshot()
+	if recording {
+		recSuppress = true
+		recAutoStarted = false
+		return teleSetRecording(false)
+	}
+	recSuppress = false
+	recAutoStarted = false
+	return teleSetRecording(true)
+}
+
+// teleAutoRecord drives the automatic start/stop. Called every loop
+// pass with the freshest sample and feed state.
+func teleAutoRecord(s Sample, live bool) {
+	_, _, recording, _, _ := teleSnapshot()
+	if !live {
+		if recording && recAutoStarted {
+			recAutoStarted = false
+			teleSetRecording(false)
+		}
+		garageSince = time.Time{}
+		return
+	}
+	inGarage := s.InPits && s.SpeedKmh < 1
+	rolling := !s.InPits && s.SpeedKmh > 5
+	if inGarage {
+		if garageSince.IsZero() {
+			garageSince = time.Now()
+		}
+		recSuppress = false // back in the garage: next stint may record
+		if recording && recAutoStarted && time.Since(garageSince) > 3*time.Second {
+			recAutoStarted = false
+			teleSetRecording(false)
+		}
+		return
+	}
+	garageSince = time.Time{}
+	if rolling && !recording && !recSuppress {
+		if msg := teleSetRecording(true); msg != "" {
+			recAutoStarted = true
+			logLine("telemetry: auto-record started")
+		}
+	}
+}
+
 // teleSetRecording starts or stops the CSV recording. Returns a status line.
 func teleSetRecording(on bool) string {
 	recMu.Lock()
@@ -205,6 +263,7 @@ func teleLoop() {
 			tele.mu.Lock()
 			tele.feedLive = false
 			tele.mu.Unlock()
+			teleAutoRecord(Sample{}, false)
 			time.Sleep(2 * time.Second)
 			continue
 		}
@@ -233,8 +292,18 @@ func teleLoop() {
 		tele.feedLive = true
 		histPush(&s)
 		eng.Tick(s)
+		stints.update(s.Field)
+		if o := learner.Observe(s); o != nil {
+			dir := filepath.Join(configDir(), "tracks")
+			if err := saveOutline(dir, o); err == nil {
+				logLine("track outline learned and stored: " + o.Track)
+			} else {
+				logLine("track outline save failed: " + err.Error())
+			}
+		}
 		rec := tele.recording
 		tele.mu.Unlock()
+		teleAutoRecord(s, true)
 
 		if rec && now.Sub(lastRow) >= 20*time.Millisecond {
 			lastRow = now

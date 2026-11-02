@@ -117,7 +117,7 @@ func fuelToIndex(ratio float64) int { return int(math.Round(ratio*100)) - 1 }
 // radiator habit and the wing index that means "low drag" on that car.
 type CarProfile struct {
 	Name         string
-	Short        string // used in file names
+	Short        string  // used in file names
 	BiasIdxAt    int     // an index whose value is known
 	BiasValAt    float64 // front % at that index
 	BiasStep     float64 // front % per click (value falls as index rises)

@@ -60,17 +60,19 @@ var carTemplates = []string{
 }
 
 type Config struct {
-	LMUPath   string          `json:"lmu_path"`
-	OverlayOn    bool            `json:"overlay_on"`
-	Panels       map[string]bool `json:"panels,omitempty"`
-	PanelPos     map[string][]int `json:"panel_pos,omitempty"`
-	OverlayScale float64         `json:"overlay_scale,omitempty"`
-	TeleDir      string          `json:"tele_dir,omitempty"`
+	LMUPath      string             `json:"lmu_path"`
+	OverlayOn    bool               `json:"overlay_on"`
+	Panels       map[string]bool    `json:"panels,omitempty"`
+	PanelPos     map[string][]int   `json:"panel_pos,omitempty"`
+	PanelScale   map[string]float64 `json:"panel_scale,omitempty"`   // v1.3 per-panel free scale
+	OverlayScale float64            `json:"overlay_scale,omitempty"` // pre-1.3 global scale (migration seed)
+	TeleDir      string             `json:"tele_dir,omitempty"`
+	WhatsNewAck  string             `json:"whatsnew_ack,omitempty"` // last x.y.0 notice dismissed
 }
 
 func currentCfg() Config {
-	on, panels, pos, scale := overlayConfig()
-	return Config{LMUPath: lmuPath, OverlayOn: on, Panels: panels, PanelPos: pos, OverlayScale: scale, TeleDir: teleFolder}
+	on, panels, pos, scales, legacy := overlayConfig()
+	return Config{LMUPath: lmuPath, OverlayOn: on, Panels: panels, PanelPos: pos, PanelScale: scales, OverlayScale: legacy, TeleDir: teleFolder, WhatsNewAck: whatsNewAck}
 }
 
 var (
@@ -91,14 +93,15 @@ var (
 	teleDirLbl  *walk.Label
 	teleFolder  string // custom telemetry save folder ("" = default, next to the exe)
 	ovToggleBtn *walk.PushButton
-	ovCBInputs  *walk.CheckBox
-	ovCBDelta   *walk.CheckBox
-	ovCBRel     *walk.CheckBox
-	ovCBTyres   *walk.CheckBox
-	ovCBFuel    *walk.CheckBox
-	ovCBEng     *walk.CheckBox
 	ovEditBtn   *walk.PushButton
-	ovScaleCB   *walk.ComboBox
+	swInputs    *walk.CustomWidget
+	swDelta     *walk.CustomWidget
+	swTower     *walk.CustomWidget
+	swTyres     *walk.CustomWidget
+	swEng       *walk.CustomWidget
+	swFlags     *walk.CustomWidget
+	whatsNewBox *walk.Composite
+	whatsNewAck string
 	lmuPath     string
 	trackNames  []string
 	carKinds    []int    // parallel to carCB model: 0-9 = built-in profile index, 100 = his file
@@ -465,9 +468,7 @@ func onUpdateClicked() {
 }
 
 func onTeleRecord() {
-	_, _, recording, _, _ := teleSnapshot()
-	msg := teleSetRecording(!recording)
-	if msg != "" {
+	if msg := teleToggleRecord(); msg != "" {
 		say(msg)
 	}
 }
@@ -506,6 +507,51 @@ func teleUIRefresh() {
 	}
 }
 
+// drawSwitch paints one overlay-panel toggle switch (teal = on).
+func drawSwitch(cv *walk.Canvas, b walk.Rectangle, on bool) error {
+	// Preview9: fill the ENTIRE bounds with the OVERLAY page's navy
+	// first. These switches are PaintNormal CustomWidgets with no
+	// Background brush (and neither has their row composite), so
+	// walk's WM_ERASEBKGND handling finds no brush to erase with and
+	// falls through to DefWindowProc, which erases with the
+	// window-class brush — COLOR_BTNFACE light grey — and the pill
+	// alone (42x18 inside the 46x24 bounds) never covered the erased
+	// margins: a permanent light block around every switch. Painting
+	// the full update bounds here cannot be overridden by erase order.
+	bgR, bgG, bgB := switchPageBackgroundRGB()
+	bb, err := walk.NewSolidColorBrush(walk.RGB(bgR, bgG, bgB))
+	if err != nil {
+		return err
+	}
+	defer bb.Dispose()
+	if err := cv.FillRectangle(bb, b); err != nil {
+		return err
+	}
+	trackCol := walk.RGB(0x2b, 0x36, 0x48)
+	if on {
+		trackCol = walk.RGB(0x2e, 0xc4, 0xb6)
+	}
+	tb, err := walk.NewSolidColorBrush(trackCol)
+	if err != nil {
+		return err
+	}
+	defer tb.Dispose()
+	rect := walk.Rectangle{X: b.X + 1, Y: b.Y + 3, Width: 42, Height: 18}
+	if err := cv.FillRoundedRectangle(tb, rect, walk.Size{Width: 16, Height: 16}); err != nil {
+		return err
+	}
+	kb, err := walk.NewSolidColorBrush(walk.RGB(0xf7, 0xf7, 0xff))
+	if err != nil {
+		return err
+	}
+	defer kb.Dispose()
+	kx := rect.X + 3
+	if on {
+		kx = rect.X + rect.Width - 15
+	}
+	return cv.FillEllipse(kb, walk.Rectangle{X: kx, Y: rect.Y + 3, Width: 12, Height: 12})
+}
+
 func main() {
 	defer func() {
 		if r := recover(); r != nil {
@@ -529,7 +575,6 @@ func main() {
 	}
 
 	persistOverlay := func() { saveCfg(currentCfg()) }
-	ovRefreshing := false
 	refreshOverlayUI := func() {
 		if ovToggleBtn == nil {
 			return
@@ -539,63 +584,78 @@ func main() {
 		} else {
 			ovToggleBtn.SetText("SHOW OVERLAY")
 		}
-		ovRefreshing = true
-		ovCBInputs.SetChecked(ovState.Inputs.Load())
-		ovCBDelta.SetChecked(ovState.Delta.Load())
-		ovCBRel.SetChecked(ovState.Relative.Load())
-		ovCBTyres.SetChecked(ovState.Tyres.Load())
-		ovCBFuel.SetChecked(ovState.Fuel.Load())
-		ovCBEng.SetChecked(ovState.Engineer.Load())
-		ovRefreshing = false
+		for _, sw := range []*walk.CustomWidget{swInputs, swDelta, swTower, swTyres, swEng, swFlags} {
+			if sw != nil {
+				sw.Invalidate()
+			}
+		}
 		if ovState.Edit.Load() {
 			ovEditBtn.SetText("DONE MOVING")
 		} else {
 			ovEditBtn.SetText("MOVE PANELS")
 		}
-		scales := []float64{0.8, 1.0, 1.25, 1.5}
-		best, bi := 1e9, 1
-		for i, sv := range scales {
-			if d := ovScaleVal() - sv; d < 0 {
-				if -d < best {
-					best, bi = -d, i
-				}
-			} else if d < best {
-				best, bi = d, i
-			}
-		}
-		ovScaleCB.SetCurrentIndex(bi)
 	}
 	onOverlayToggle := func() {
 		ovState.Shown.Store(!ovState.Shown.Load())
+		// Manual override for THIS RUN only (preview8): the overlay
+		// re-arms itself at the next startup whatever gets saved.
+		if ovState.Shown.Load() {
+			logLine("overlay: manual show (this run)")
+		} else {
+			logLine("overlay: manual hide (this run only; re-arms at startup)")
+		}
 		refreshOverlayUI()
-	refreshTeleDirLbl()
+		refreshTeleDirLbl()
 		persistOverlay()
 	}
 	onEditToggle := func() {
 		ovState.Edit.Store(!ovState.Edit.Load())
 		refreshOverlayUI()
 	}
-	onScaleChanged := func() {
-		scales := []float64{0.8, 1.0, 1.25, 1.5}
-		i := ovScaleCB.CurrentIndex()
-		if i >= 0 && i < len(scales) {
-			ovSetScale(scales[i])
-			persistOverlay()
+	// flipPanel toggles one overlay panel from its switch.
+	flipPanel := func(id string) {
+		switch id {
+		case "inputs":
+			ovState.Inputs.Store(!ovState.Inputs.Load())
+		case "delta":
+			ovState.Delta.Store(!ovState.Delta.Load())
+		case "relative":
+			ovState.Tower.Store(!ovState.Tower.Load())
+		case "tyres":
+			ovState.Tyres.Store(!ovState.Tyres.Load())
+		case "engineer":
+			ovState.Engineer.Store(!ovState.Engineer.Load())
+		case "flags":
+			ovState.Flags.Store(!ovState.Flags.Load())
 		}
-	}
-	onOverlayPanels := func() {
-		if ovRefreshing {
-			return
-		}
-		ovState.Inputs.Store(ovCBInputs.Checked())
-		ovState.Delta.Store(ovCBDelta.Checked())
-		ovState.Relative.Store(ovCBRel.Checked())
-		ovState.Tyres.Store(ovCBTyres.Checked())
-		ovState.Fuel.Store(ovCBFuel.Checked())
-		ovState.Engineer.Store(ovCBEng.Checked())
+		refreshOverlayUI()
 		persistOverlay()
 	}
-	overlayInit(cfg.OverlayOn, cfg.Panels, cfg.PanelPos, cfg.OverlayScale)
+	mkSwitch := func(assign **walk.CustomWidget, get func() bool, id string) CustomWidget {
+		return CustomWidget{
+			AssignTo: assign,
+			MinSize:  Size{Width: 46, Height: 24},
+			MaxSize:  Size{Width: 46, Height: 24},
+			Paint: func(cv *walk.Canvas, b walk.Rectangle) error {
+				return drawSwitch(cv, b, get())
+			},
+			OnMouseDown: func(x, y int, button walk.MouseButton) {
+				if button == walk.LeftButton {
+					flipPanel(id)
+				}
+			},
+		}
+	}
+	dismissWhatsNew := func() {
+		whatsNewAck = versionMinor(AppVersion)
+		saveCfg(currentCfg())
+		if whatsNewBox != nil {
+			whatsNewBox.SetVisible(false)
+		}
+	}
+	engLogFn = logLine
+	whatsNewAck = cfg.WhatsNewAck
+	overlayInit(cfg.OverlayOn, cfg.Panels, cfg.PanelPos, cfg.PanelScale, cfg.OverlayScale)
 	saveOverlayLayout = persistOverlay
 
 	navy := walk.RGB(0x0d, 0x13, 0x21)    // KAIGO --bg
@@ -609,9 +669,14 @@ func main() {
 		AssignTo:   &mw,
 		Background: SolidColorBrush{Color: navy},
 		Title:      "LMU Setup Builder — Powered by Jett · v" + AppVersion,
-		Size:       Size{Width: 760, Height: 660},
-		MinSize:    Size{Width: 620, Height: 600},
-		Layout:     VBox{MarginsZero: true, Spacing: 0},
+		Size:       Size{Width: 1000, Height: 720},
+		MinSize:    Size{Width: 900, Height: 640},
+		// Preview1 sprawled on Ari's wide display: content with huge
+		// minimum sizes (see the What's New label below) stretched the
+		// window, and a maximised window stretched the layouts. The
+		// cap keeps the app at its designed proportions anywhere.
+		MaxSize: Size{Width: 1280, Height: 850},
+		Layout:  VBox{MarginsZero: true, Spacing: 0},
 		Children: []Widget{
 			Composite{
 				Background: SolidColorBrush{Color: surface},
@@ -638,117 +703,159 @@ func main() {
 				},
 			},
 			Composite{
-				Background: SolidColorBrush{Color: navy},
-				Layout:     VBox{Margins: Margins{Left: 16, Top: 10, Right: 16, Bottom: 10}, Spacing: 7},
+				AssignTo:   &whatsNewBox,
+				Background: SolidColorBrush{Color: walk.RGB(0x17, 0x2a, 0x4f)},
+				Layout:     HBox{Margins: Margins{Left: 16, Top: 8, Right: 16, Bottom: 8}, Spacing: 10},
 				Children: []Widget{
-					Composite{
-						Layout: HBox{MarginsZero: true},
-						Children: []Widget{
-							Label{AssignTo: &statusLbl, Text: "Game folder: …", TextColor: muted},
-							HSpacer{},
-							PushButton{Text: "Change folder", OnClicked: pickFolder},
-						},
+					Label{
+						// Short, manually broken lines: preview1 used one
+						// ~700-character line, whose minimum width dragged
+						// the whole window ultrawide-wide.
+						Text:      "WHAT'S NEW IN v" + AppVersion + " — Tower replaces Relative (classes, stints, damage) · Delta arms from lap 2\r\nEngineer quotes a DEFAULT PLAN when the pit menu is silent · Inputs gains an RPM bar, big gear digit & pit-limiter mode\r\nFlag pill (green/yellow/blue) · Logger auto-records and learns track outlines · New REVIEW tab · Panels resize freely",
+						TextColor: paper,
+						MaxSize:   Size{Width: 980},
 					},
-					Composite{
-						Layout: HBox{MarginsZero: true, Spacing: 8},
+					PushButton{Text: "GOT IT", OnClicked: dismissWhatsNew},
+				},
+			},
+			TabWidget{
+				Pages: []TabPage{
+					{
+						Title:      "SETUP",
+						Background: SolidColorBrush{Color: navy},
+						Layout:     VBox{Margins: Margins{Left: 16, Top: 10, Right: 16, Bottom: 10}, Spacing: 7},
 						Children: []Widget{
-							Label{Text: "Car", Font: Font{Family: "Segoe UI", PointSize: 11, Bold: true}, TextColor: paper, MinSize: Size{Width: 150}},
-							ComboBox{AssignTo: &carCB, Model: []string{"Lexus RC F LMGT3 — Jett calibrated", "McLaren 720S LMGT3 — Jett calibrated"}},
-						},
-					},
-					Composite{
-						Layout: HBox{MarginsZero: true, Spacing: 8},
-						Children: []Widget{
-							Label{Text: "Track", Font: Font{Family: "Segoe UI", PointSize: 11, Bold: true}, TextColor: paper, MinSize: Size{Width: 150}},
-							ComboBox{AssignTo: &trackCB, Model: []string{"…"}},
-						},
-					},
-					Composite{
-						Layout: HBox{MarginsZero: true, Spacing: 8},
-						Children: []Widget{
-							Label{Text: "Session", Font: Font{Family: "Segoe UI", PointSize: 11, Bold: true}, TextColor: paper, MinSize: Size{Width: 150}},
-							ComboBox{
-								AssignTo:     &sessionCB,
-								Model:        []string{"Qualifying", "Race — 20 min", "Race — 30 min", "Race — 60 min"},
-								CurrentIndex: 0,
-								OnCurrentIndexChanged: func() {
-									if sessionCB.CurrentIndex() == 3 {
-										veCB.SetCurrentIndex(1)
-									} else {
-										veCB.SetCurrentIndex(0)
-									}
+							Composite{
+								Layout: HBox{MarginsZero: true},
+								Children: []Widget{
+									Label{AssignTo: &statusLbl, Text: "Game folder: …", TextColor: muted},
+									HSpacer{},
+									PushButton{Text: "Change folder", OnClicked: pickFolder},
 								},
 							},
+							Composite{
+								Layout: HBox{MarginsZero: true, Spacing: 8},
+								Children: []Widget{
+									Label{Text: "Car", Font: Font{Family: "Segoe UI", PointSize: 11, Bold: true}, TextColor: paper, MinSize: Size{Width: 150}},
+									ComboBox{AssignTo: &carCB, Model: []string{"Lexus RC F LMGT3 — Jett calibrated", "McLaren 720S LMGT3 — Jett calibrated"}},
+								},
+							},
+							Composite{
+								Layout: HBox{MarginsZero: true, Spacing: 8},
+								Children: []Widget{
+									Label{Text: "Track", Font: Font{Family: "Segoe UI", PointSize: 11, Bold: true}, TextColor: paper, MinSize: Size{Width: 150}},
+									ComboBox{AssignTo: &trackCB, Model: []string{"…"}},
+								},
+							},
+							Composite{
+								Layout: HBox{MarginsZero: true, Spacing: 8},
+								Children: []Widget{
+									Label{Text: "Session", Font: Font{Family: "Segoe UI", PointSize: 11, Bold: true}, TextColor: paper, MinSize: Size{Width: 150}},
+									ComboBox{
+										AssignTo:     &sessionCB,
+										Model:        []string{"Qualifying", "Race — 20 min", "Race — 30 min", "Race — 60 min"},
+										CurrentIndex: 0,
+										OnCurrentIndexChanged: func() {
+											if sessionCB.CurrentIndex() == 3 {
+												veCB.SetCurrentIndex(1)
+											} else {
+												veCB.SetCurrentIndex(0)
+											}
+										},
+									},
+								},
+							},
+							Composite{
+								Layout: HBox{MarginsZero: true, Spacing: 8},
+								Children: []Widget{
+									Label{Text: "Energy cap", Font: Font{Family: "Segoe UI", PointSize: 11, Bold: true}, TextColor: paper, MinSize: Size{Width: 150}},
+									ComboBox{AssignTo: &veCB, Model: []string{"100% (daily / standard)", "75% (WEC-Xperience)"}, CurrentIndex: 0},
+								},
+							},
+							Composite{
+								Layout: HBox{MarginsZero: true, Spacing: 8},
+								Children: []Widget{
+									Label{Text: "Feel", Font: Font{Family: "Segoe UI", PointSize: 11, Bold: true}, TextColor: paper, MinSize: Size{Width: 150}},
+									ComboBox{AssignTo: &feelCB, Model: []string{"Balanced", "Stable", "Rotating"}, CurrentIndex: 0},
+								},
+							},
+							PushButton{
+								AssignTo:   &genBtn,
+								Text:       "GENERATE & APPLY",
+								Font:       Font{Family: "Segoe UI", PointSize: 12, Bold: true},
+								Background: SolidColorBrush{Color: orange},
+								OnClicked:  generate,
+								MaxSize:    Size{Height: 44},
+							},
+							Label{Text: "What Jett did:", Font: Font{Family: "Segoe UI", PointSize: 11, Bold: true}, TextColor: muted},
+							TextEdit{AssignTo: &outputTE, ReadOnly: true, VScroll: true, MinSize: Size{Height: 160}, MaxSize: Size{Height: 520}, Background: SolidColorBrush{Color: surface}, TextColor: paper},
+							VSpacer{},
 						},
 					},
-					Composite{
-						Layout: HBox{MarginsZero: true, Spacing: 8},
+					{
+						Title:      "OVERLAY",
+						Background: SolidColorBrush{Color: navy},
+						Layout:     VBox{Margins: Margins{Left: 16, Top: 10, Right: 16, Bottom: 10}, Spacing: 7},
 						Children: []Widget{
-							Label{Text: "Energy cap", Font: Font{Family: "Segoe UI", PointSize: 11, Bold: true}, TextColor: paper, MinSize: Size{Width: 150}},
-							ComboBox{AssignTo: &veCB, Model: []string{"100% (daily / standard)", "75% (WEC-Xperience)"}, CurrentIndex: 0},
+							Label{Text: "TELEMETRY & OVERLAY", Font: Font{Family: "Segoe UI", PointSize: 11, Bold: true}, TextColor: teal},
+							Label{AssignTo: &teleStatus, Text: "Game feed: waiting…", TextColor: muted},
+							Label{AssignTo: &teleLive, TextColor: paper, Font: Font{Family: "Consolas", PointSize: 11}, Text: "— km/h    THR —%    BRK —%    Gear –    Lap –"},
+							Composite{
+								MinSize: Size{Height: 34},
+								MaxSize: Size{Height: 34},
+								Layout:  HBox{MarginsZero: true, Spacing: 8},
+								Children: []Widget{
+									PushButton{Text: "INSTALL GAME FEED", OnClicked: onTeleInstall},
+									PushButton{AssignTo: &teleRecBtn, Text: "●  START RECORDING", Font: Font{Family: "Segoe UI", PointSize: 11, Bold: true}, Background: SolidColorBrush{Color: teal}, OnClicked: onTeleRecord},
+									PushButton{Text: "OPEN FOLDER", OnClicked: onTeleOpenFolder},
+									PushButton{AssignTo: &ovToggleBtn, Text: "SHOW OVERLAY", OnClicked: onOverlayToggle},
+									PushButton{AssignTo: &ovEditBtn, Text: "MOVE PANELS", OnClicked: onEditToggle},
+									HSpacer{},
+								},
+							},
+							Composite{
+								MinSize: Size{Height: 30},
+								MaxSize: Size{Height: 30},
+								Layout:  HBox{MarginsZero: true, Spacing: 8},
+								Children: []Widget{
+									Label{Text: "Saves to:", TextColor: muted},
+									Label{AssignTo: &teleDirLbl, TextColor: paper},
+									PushButton{Text: "CHANGE FOLDER", OnClicked: onTeleDirPick},
+									PushButton{Text: "RESET", OnClicked: onTeleDirReset},
+									HSpacer{},
+								},
+							},
+							Label{Text: "PANELS", Font: Font{Family: "Segoe UI", PointSize: 11, Bold: true}, TextColor: teal},
+							Composite{
+								// Fixed height: in preview1 this row had no cap
+								// inside the page's VBox, so it absorbed ALL the
+								// page's spare height and the box layout stretched
+								// the switches into giant white columns.
+								MinSize: Size{Height: 30},
+								MaxSize: Size{Height: 30},
+								Layout:  HBox{MarginsZero: true, Spacing: 6},
+								Children: []Widget{
+									mkSwitch(&swInputs, func() bool { return ovState.Inputs.Load() }, "inputs"),
+									Label{Text: "Inputs", TextColor: paper, MaxSize: Size{Width: 64, Height: 24}},
+									mkSwitch(&swDelta, func() bool { return ovState.Delta.Load() }, "delta"),
+									Label{Text: "Delta", TextColor: paper, MaxSize: Size{Width: 64, Height: 24}},
+									mkSwitch(&swTower, func() bool { return ovState.Tower.Load() }, "relative"),
+									Label{Text: "Tower", TextColor: paper, MaxSize: Size{Width: 64, Height: 24}},
+									mkSwitch(&swTyres, func() bool { return ovState.Tyres.Load() }, "tyres"),
+									Label{Text: "Tyres", TextColor: paper, MaxSize: Size{Width: 64, Height: 24}},
+									mkSwitch(&swEng, func() bool { return ovState.Engineer.Load() }, "engineer"),
+									Label{Text: "Engineer", TextColor: paper, MaxSize: Size{Width: 64, Height: 24}},
+									mkSwitch(&swFlags, func() bool { return ovState.Flags.Load() }, "flags"),
+									Label{Text: "Flags", TextColor: paper, MaxSize: Size{Width: 64, Height: 24}},
+									HSpacer{},
+								},
+							},
+							Label{Text: "Recording is automatic now: it starts when the car rolls on track and stops in the garage. The record button is a manual override.", TextColor: muted},
+							Label{Text: "MOVE PANELS lets you drag panels where your eyes go — even before the game starts.\r\nDrag a panel's bottom-right corner to resize it; double-click the corner to reset its size. Game must be in borderless mode.", TextColor: muted},
+							VSpacer{},
 						},
 					},
-					Composite{
-						Layout: HBox{MarginsZero: true, Spacing: 8},
-						Children: []Widget{
-							Label{Text: "Feel", Font: Font{Family: "Segoe UI", PointSize: 11, Bold: true}, TextColor: paper, MinSize: Size{Width: 150}},
-							ComboBox{AssignTo: &feelCB, Model: []string{"Balanced", "Stable", "Rotating"}, CurrentIndex: 0},
-						},
-					},
-					PushButton{
-						AssignTo:   &genBtn,
-						Text:       "GENERATE & APPLY",
-						Font:       Font{Family: "Segoe UI", PointSize: 12, Bold: true},
-						Background: SolidColorBrush{Color: orange},
-						OnClicked:  generate,
-					},
-					Label{Text: "What Jett did:", Font: Font{Family: "Segoe UI", PointSize: 11, Bold: true}, TextColor: muted},
-					TextEdit{AssignTo: &outputTE, ReadOnly: true, VScroll: true, MinSize: Size{Height: 104}, Background: SolidColorBrush{Color: surface}, TextColor: paper},
-					Label{Text: "TELEMETRY & OVERLAY", Font: Font{Family: "Segoe UI", PointSize: 11, Bold: true}, TextColor: teal},
-					Label{AssignTo: &teleStatus, Text: "Game feed: waiting…", TextColor: muted},
-					Label{AssignTo: &teleLive, TextColor: paper, Font: Font{Family: "Consolas", PointSize: 11}, Text: "— km/h    THR —%    BRK —%    Gear –    Lap –"},
-					Composite{
-						Layout: HBox{MarginsZero: true, Spacing: 8},
-						Children: []Widget{
-							PushButton{Text: "INSTALL GAME FEED", OnClicked: onTeleInstall},
-							PushButton{AssignTo: &teleRecBtn, Text: "●  START RECORDING", Font: Font{Family: "Segoe UI", PointSize: 11, Bold: true}, Background: SolidColorBrush{Color: teal}, OnClicked: onTeleRecord},
-							PushButton{Text: "OPEN FOLDER", OnClicked: onTeleOpenFolder},
-							PushButton{AssignTo: &ovToggleBtn, Text: "SHOW OVERLAY", OnClicked: onOverlayToggle},
-							PushButton{AssignTo: &ovEditBtn, Text: "MOVE PANELS", OnClicked: onEditToggle},
-							HSpacer{},
-							Label{Text: "Size", TextColor: paper},
-							ComboBox{AssignTo: &ovScaleCB, Model: []string{"80%", "100%", "125%", "150%"}, CurrentIndex: 1, MinSize: Size{Width: 84}, OnCurrentIndexChanged: onScaleChanged},
-						},
-					},
-					Composite{
-						Layout: HBox{MarginsZero: true, Spacing: 8},
-						Children: []Widget{
-							Label{Text: "Saves to:", TextColor: muted},
-							Label{AssignTo: &teleDirLbl, TextColor: paper},
-							PushButton{Text: "CHANGE FOLDER", OnClicked: onTeleDirPick},
-							PushButton{Text: "RESET", OnClicked: onTeleDirReset},
-							HSpacer{},
-						},
-					},
-					Composite{
-						Layout: HBox{MarginsZero: true, Spacing: 6},
-						Children: []Widget{
-							CheckBox{AssignTo: &ovCBInputs, OnCheckedChanged: onOverlayPanels},
-							Label{Text: "Inputs", TextColor: paper, MaxSize: Size{Width: 56}},
-							CheckBox{AssignTo: &ovCBDelta, OnCheckedChanged: onOverlayPanels},
-							Label{Text: "Delta", TextColor: paper, MaxSize: Size{Width: 56}},
-							CheckBox{AssignTo: &ovCBRel, OnCheckedChanged: onOverlayPanels},
-							Label{Text: "Relative", TextColor: paper, MaxSize: Size{Width: 56}},
-							CheckBox{AssignTo: &ovCBTyres, OnCheckedChanged: onOverlayPanels},
-							Label{Text: "Tyres", TextColor: paper, MaxSize: Size{Width: 56}},
-							CheckBox{AssignTo: &ovCBFuel, OnCheckedChanged: onOverlayPanels},
-							Label{Text: "Fuel", TextColor: paper, MaxSize: Size{Width: 56}},
-							CheckBox{AssignTo: &ovCBEng, OnCheckedChanged: onOverlayPanels},
-							Label{Text: "Engineer", TextColor: paper, MaxSize: Size{Width: 56}},
-							HSpacer{},
-						},
-					},
-					Label{Text: "MOVE PANELS lets you drag panels where your eyes go — even before the game starts. Game must be in borderless mode.", TextColor: muted},
+					reviewPage(),
 				},
 			},
 		},
@@ -769,10 +876,19 @@ func main() {
 			logLine("window icon set failed: " + err.Error())
 		}
 	}
+	// What's New: shown once per feature (x.y.0) release until
+	// dismissed; a missing ack counts as unacknowledged, so the
+	// upgrade itself shows it. Patch bumps never show it.
+	if whatsNewBox != nil {
+		whatsNewBox.SetVisible(isFeatureRelease(AppVersion) && whatsNewAck != versionMinor(AppVersion))
+	}
 	refreshOverlayUI()
 	refreshStatus()
 	refreshTracks()
 	refreshCars()
+	revRefreshSessions()
+	rev.speed = 1
+	go reviewTicker()
 	go overlayLoop()
 	os.MkdirAll(teleDir(), 0755)
 	go teleLoop()

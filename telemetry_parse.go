@@ -15,8 +15,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
-	"sync"
 	"strings"
+	"sync"
 )
 
 // Each mapped file starts with an 8-byte version block (two counters the
@@ -29,24 +29,30 @@ const (
 	tVehicles    = 8
 	tVehStride   = 1888
 
-	vID          = 0
-	vElapsedTime = 12
-	vLapNumber   = 20
-	vVehicleName = 32
-	vTrackName   = 96
-	vLocalVel    = 184 // rF2Vec3: x, y, z doubles
-	vGear        = 352
-	vEngineRPM   = 356
-	vUnfThrottle = 388
-	vUnfBrake    = 396
-	vUnfSteering = 404
-	vFilThrottle = 420
-	vFilBrake    = 428
-	vFuel        = 524
-	vDetached    = 542
-	vDentSeverity = 544
-	vSector      = 600
-	vWheels      = 848
+	vID            = 0
+	vElapsedTime   = 12
+	vLapNumber     = 20
+	vVehicleName   = 32
+	vTrackName     = 96
+	vPos           = 160 // rF2Vec3: world position x, y, z doubles
+	vLocalVel      = 184 // rF2Vec3: x, y, z doubles
+	vGear          = 352
+	vEngineRPM     = 356
+	vUnfThrottle   = 388
+	vUnfBrake      = 396
+	vUnfSteering   = 404
+	vFilThrottle   = 420
+	vFilBrake      = 428
+	vFuel          = 524
+	vMaxRPM        = 532
+	vDetached      = 542
+	vDentSeverity  = 544
+	vSector        = 600
+	vSpeedLimiter  = 604 // byte: pit limiter engaged
+	vFuelCapacity  = 608
+	vLimiterAvail  = 656 // byte: limiter available in this car/session
+	vRearBrakeBias = 664 // double: fraction of braking on the rear axle
+	vWheels        = 848
 
 	wheelStride  = 260
 	wPressure    = 120
@@ -54,38 +60,53 @@ const (
 	wFlat        = 177
 	wDetachedW   = 178
 	wWear        = 152
+	wCarcassTemp = 204 // mTireCarcassTemperature — the stable core temp the game shows
+	wInnerTemp   = 212 // mTireInnerLayerTemperature
 )
 
 // Scoring payload offsets.
 const (
-	sInfo       = 4
-	siTrackName = 0
-	siSession   = 64
-	siCurrentET = 68
-	siEndET     = 76
-	siMaxLaps   = 84
-	siLapDist   = 88 // track length in metres
-	siNumVeh    = 104
-	siGamePhase = 108
-	siRaining   = 220
-	siTrackTemp = 236
+	sInfo         = 4
+	siTrackName   = 0
+	siSession     = 64
+	siCurrentET   = 68
+	siEndET       = 76
+	siMaxLaps     = 84
+	siLapDist     = 88 // track length in metres
+	siNumVeh      = 104
+	siGamePhase   = 108
+	siYellowFlag  = 109 // signed char: full-course yellow state
+	siSectorFlag  = 110 // signed char[3]: yellow per sector
+	siRaining     = 220
+	siAmbientTemp = 228
+	siTrackTemp   = 236
 
-	sVehicles    = 552
-	sVehStride   = 584
-	svID         = 0
-	svDriverName = 4
-	svVehName    = 36
-	svTotalLaps  = 100
-	svSector     = 102
-	svLapDist    = 104
-	svBestLap    = 144
-	svLastLap    = 168
-	svPitstops   = 192
-	svBehindLead = 244
-	svIsPlayer   = 196
-	svInPits     = 198
-	svPitState   = 457
-	svPlace      = 199
+	sVehicles     = 552
+	sVehStride    = 584
+	svID          = 0
+	svDriverName  = 4
+	svVehName     = 36
+	svTotalLaps   = 100
+	svSector      = 102
+	svLapDist     = 104
+	svBestLap     = 144
+	svLastSector1 = 152
+	svLastSector2 = 160
+	svLastLap     = 168
+	svCurSector1  = 176
+	svCurSector2  = 184
+	svPitstops    = 192
+	svIsPlayer    = 196
+	svInPits      = 198
+	svPlace       = 199
+	svVehClass    = 200 // char[32]
+	svBehindNext  = 232
+	svBehindLead  = 244
+	svLocalVel    = 288 // rF2Vec3: local velocity x, y, z doubles (layout dump, VehicleScoringInfoV01)
+	svPitState    = 457
+	svFlag        = 504 // 0 = green, 6 = blue (being shown to this car)
+	svBestLapS1   = 528 // float: sector 1 split of the car's best lap
+	svBestLapS2   = 532 // float: sector 2 split of the car's best lap
 )
 
 // Full mapped-file sizes (version block + payload).
@@ -96,58 +117,87 @@ const (
 
 // Sample is one snapshot of the player's car.
 type Sample struct {
-	OK          bool
-	ElapsedTime float64
-	LapNumber   int
-	LapDist     float64
-	TrackLength float64
-	TrackName   string
-	VehicleName string
-	SpeedKmh    float64
-	Throttle    float64 // unfiltered (the driver's actual foot), 0..1
-	Brake       float64
-	Steering    float64 // -1..1
-	ThrottleF   float64 // filtered (what the car applied)
-	BrakeF      float64
-	Gear        int
-	RPM         float64
-	Fuel        float64
-	Sector      int
-	InPits      bool
-	Place       int
-	LastLap     float64
-	BestLap     float64
-	SessionET   float64 // session clock now
-	SessionLeft float64 // seconds left in a timed session; -1 when unknown
-	MaxLaps     int
-	Raining     float64 // 0..1 from the scoring header
-	TrackTemp   float64
-	PitState    int // 0 none, 1 requested, 2 entering, 3 stopped, 4 exiting
-	PitStops    int
-	Dents       [8]int // dent severity 0..2 at 8 points around the car
-	PartsOff    bool   // any bodywork detached
-	TyreFlat    [4]bool
-	TyreOff     [4]bool
-	MenuCat     string // pit MFD category currently shown ("" = no data)
-	MenuChoice  string // pit MFD choice currently selected
-	TyreWear    [4]float64 // fraction remaining, FL FR RL RR
-	TyrePress   [4]float64 // kPa
-	TyreTemp    [4]float64 // Celsius, centre of tread
-	Field       []CarInfo  // every car in scoring order
+	OK            bool
+	ElapsedTime   float64
+	LapNumber     int
+	LapDist       float64
+	TrackLength   float64
+	TrackName     string
+	VehicleName   string
+	SpeedKmh      float64
+	Throttle      float64 // unfiltered (the driver's actual foot), 0..1
+	Brake         float64
+	Steering      float64 // -1..1
+	ThrottleF     float64 // filtered (what the car applied)
+	BrakeF        float64
+	Gear          int
+	RPM           float64
+	MaxRPM        float64 // engine's rev ceiling from the feed (0 = unknown)
+	Fuel          float64
+	FuelCapacity  float64 // litres, from the telemetry vehicle
+	Sector        int
+	InPits        bool
+	Place         int
+	Class         string // player's class (scoring mVehicleClass)
+	LastLap       float64
+	BestLap       float64
+	CurSector1    float64 // current lap's sector splits (cumulative seconds)
+	CurSector2    float64
+	BestLapS1     float64 // best lap's sector splits (cumulative seconds)
+	BestLapS2     float64
+	SessionET     float64 // session clock now
+	SessionLeft   float64 // seconds left in a timed session; -1 when unknown
+	Session       int     // scoring header mSession (0=testday, 1-4=practice, 5-8=qual, 9=warmup, 10-13=race)
+	MaxLaps       int
+	Raining       float64 // 0..1 from the scoring header
+	TrackTemp     float64
+	AmbientTemp   float64
+	GamePhase     int     // scoring header phase (5 = green running)
+	YellowState   int     // full-course yellow state (<0/0 = none)
+	SectorFlags   [3]int  // per-sector yellow flags (nonzero = yellow)
+	PosX          float64 // world position (metres) — track learning + review
+	PosY          float64
+	PosZ          float64
+	RearBrakeBias float64 // fraction of braking on the rear axle (0..1)
+	SpeedLimiter  bool
+	LimiterAvail  bool
+	PitState      int // 0 none, 1 requested, 2 entering, 3 stopped, 4 exiting
+	PitStops      int
+	Dents         [8]int // dent severity 0..2 at 8 points around the car
+	PartsOff      bool   // any bodywork detached
+	TyreFlat      [4]bool
+	TyreOff       [4]bool
+	MenuCat       string      // pit MFD category currently shown ("" = no data)
+	MenuChoice    string      // pit MFD choice currently selected
+	TyreWear      [4]float64  // fraction remaining, FL FR RL RR
+	TyrePress     [4]float64  // kPa
+	TyreTemp      [4]float64  // Celsius, centre of tread (surface)
+	TyreCarcass   [4]float64  // Celsius, carcass (core) — what the game displays
+	TyreInner     [4]float64  // Celsius, inner layer
+	Field         []CarInfo   // every car in scoring order
+	FieldDents    map[int]int // dent severity sum per vehicle ID (telemetry buffer, all cars)
 }
 
-// CarInfo is one scoring entry — the raw material for the relative panel.
+// CarInfo is one scoring entry — the raw material for the tower panel.
 type CarInfo struct {
 	ID           int
 	Driver       string
 	Vehicle      string
-	Place        int
+	Class        string
+	Place        int // overall place
 	TotalLaps    int
+	Sector       int
 	LapDist      float64
 	BehindLeader float64 // seconds behind the leader
+	BehindNext   float64 // seconds behind the car ahead (overall)
+	LastLap      float64
+	BestLap      float64
+	PitStops     int
 	IsPlayer     bool
 	InPits       bool
 	PitState     int
+	Flag         int     // flag shown to this car (0 green, 6 blue)
+	SpeedKmh     float64 // |mLocalVel| from scoring; used by the flag pill's hazard gate
 }
 
 func sf64(b []byte, off int) float64 {
@@ -155,6 +205,13 @@ func sf64(b []byte, off int) float64 {
 		return 0
 	}
 	return math.Float64frombits(binary.LittleEndian.Uint64(b[off:]))
+}
+
+func sf32(b []byte, off int) float64 {
+	if off+4 > len(b) {
+		return 0
+	}
+	return float64(math.Float32frombits(binary.LittleEndian.Uint32(b[off:])))
 }
 
 func si32(b []byte, off int) int {
@@ -211,6 +268,7 @@ func parseSample(tel, sco []byte) Sample {
 	s.TrackLength = sf64(info, siLapDist)
 	s.TrackName = sstr(info, siTrackName, 64)
 	s.SessionET = sf64(info, siCurrentET)
+	s.Session = si32(info, siSession)
 	s.SessionLeft = -1
 	if endET := sf64(info, siEndET); endET > s.SessionET {
 		s.SessionLeft = endET - s.SessionET
@@ -218,8 +276,14 @@ func parseSample(tel, sco []byte) Sample {
 	s.MaxLaps = si32(info, siMaxLaps)
 	s.Raining = sf64(info, siRaining)
 	s.TrackTemp = sf64(info, siTrackTemp)
+	s.AmbientTemp = sf64(info, siAmbientTemp)
+	s.GamePhase = int(info[siGamePhase])
+	s.YellowState = int(int8(info[siYellowFlag]))
+	for i := 0; i < 3; i++ {
+		s.SectorFlags[i] = int(int8(info[siSectorFlag+i]))
+	}
 
-	// The whole field, for the relative panel.
+	// The whole field, for the tower panel.
 	for i := 0; i < nSco; i++ {
 		vb := sco[sVehicles+i*sVehStride:]
 		if len(vb) < sVehStride {
@@ -229,13 +293,21 @@ func parseSample(tel, sco []byte) Sample {
 			ID:           si32(vb, svID),
 			Driver:       sstr(vb, svDriverName, 32),
 			Vehicle:      sstr(vb, svVehName, 64),
+			Class:        sstr(vb, svVehClass, 32),
 			Place:        int(vb[svPlace]),
 			TotalLaps:    int(int16(binary.LittleEndian.Uint16(vb[svTotalLaps:]))),
+			Sector:       int(int8(vb[svSector])),
 			LapDist:      sf64(vb, svLapDist),
 			BehindLeader: sf64(vb, svBehindLead),
+			BehindNext:   sf64(vb, svBehindNext),
+			LastLap:      sf64(vb, svLastLap),
+			BestLap:      sf64(vb, svBestLap),
+			PitStops:     int(int16(binary.LittleEndian.Uint16(vb[svPitstops:]))),
 			IsPlayer:     vb[svIsPlayer] != 0,
 			InPits:       vb[svInPits] != 0,
 			PitState:     int(vb[svPitState]),
+			Flag:         int(vb[svFlag]),
+			SpeedKmh:     math.Sqrt(math.Pow(sf64(vb, svLocalVel), 2)+math.Pow(sf64(vb, svLocalVel+8), 2)+math.Pow(sf64(vb, svLocalVel+16), 2)) * 3.6,
 		})
 	}
 
@@ -253,7 +325,12 @@ func parseSample(tel, sco []byte) Sample {
 			s.LapDist = sf64(vb, svLapDist)
 			s.LastLap = sf64(vb, svLastLap)
 			s.BestLap = sf64(vb, svBestLap)
+			s.CurSector1 = sf64(vb, svCurSector1)
+			s.CurSector2 = sf64(vb, svCurSector2)
+			s.BestLapS1 = sf32(vb, svBestLapS1)
+			s.BestLapS2 = sf32(vb, svBestLapS2)
 			s.Place = int(vb[svPlace])
+			s.Class = sstr(vb, svVehClass, 32)
 			s.InPits = vb[svInPits] != 0
 			s.PitState = int(vb[svPitState])
 			s.PitStops = int(int16(binary.LittleEndian.Uint16(vb[svPitstops:])))
@@ -297,7 +374,15 @@ func parseSample(tel, sco []byte) Sample {
 	s.BrakeF = sf64(vb, vFilBrake)
 	s.Gear = si32(vb, vGear)
 	s.RPM = sf64(vb, vEngineRPM)
+	s.MaxRPM = sf64(vb, vMaxRPM)
 	s.Fuel = sf64(vb, vFuel)
+	s.FuelCapacity = sf64(vb, vFuelCapacity)
+	s.PosX = sf64(vb, vPos)
+	s.PosY = sf64(vb, vPos+8)
+	s.PosZ = sf64(vb, vPos+16)
+	s.RearBrakeBias = sf64(vb, vRearBrakeBias)
+	s.SpeedLimiter = vb[vSpeedLimiter] != 0
+	s.LimiterAvail = vb[vLimiterAvail] != 0
 	s.Sector = si32(vb, vSector)
 	s.PartsOff = vb[vDetached] != 0
 	for i := 0; i < 8; i++ {
@@ -310,19 +395,53 @@ func parseSample(tel, sco []byte) Sample {
 		}
 		s.TyrePress[w] = sf64(wb, wPressure)
 		s.TyreTemp[w] = sf64(wb, wTemperature+8)
+		s.TyreCarcass[w] = sf64(wb, wCarcassTemp)
+		s.TyreInner[w] = sf64(wb, wInnerTemp)
 		s.TyreWear[w] = sf64(wb, wWear)
 		s.TyreFlat[w] = wb[wFlat] != 0
 		s.TyreOff[w] = wb[wDetachedW] != 0
 	}
+
+	// Dent sums for EVERY car in the telemetry buffer — the tower's DMG
+	// token reads rivals from here. (Whether LMU actually populates
+	// rivals' dents is a field question; dead data simply never shows.)
+	if nTel > 0 {
+		s.FieldDents = map[int]int{}
+		for i := 0; i < nTel; i++ {
+			vb2 := tel[tVehicles+i*tVehStride:]
+			if len(vb2) < tVehStride {
+				break
+			}
+			sum := 0
+			for k := 0; k < 8; k++ {
+				sum += int(vb2[vDentSeverity+k])
+			}
+			if sum > 0 {
+				s.FieldDents[si32(vb2, vID)] = sum
+			}
+		}
+	}
 	return s
 }
 
-const csvHeader = "et_s,lap,lap_dist_m,speed_kmh,throttle,brake,steering,gear,rpm,fuel_l\n"
+// The first ten columns are the original v1.0 format and never change;
+// v1.3 appends world position and the three tyre-temperature layers per
+// wheel (ts = surface centre, ti = inner layer, tc = carcass). Readers
+// must accept both widths.
+const csvHeader = "et_s,lap,lap_dist_m,speed_kmh,throttle,brake,steering,gear,rpm,fuel_l," +
+	"pos_x,pos_y,pos_z," +
+	"ts_fl,ts_fr,ts_rl,ts_rr,ti_fl,ti_fr,ti_rl,ti_rr,tc_fl,tc_fr,tc_rl,tc_rr\n"
 
 func csvRow(s Sample) string {
-	return fmt.Sprintf("%.3f,%d,%.1f,%.1f,%.4f,%.4f,%.4f,%d,%.0f,%.2f\n",
+	return fmt.Sprintf("%.3f,%d,%.1f,%.1f,%.4f,%.4f,%.4f,%d,%.0f,%.2f,"+
+		"%.2f,%.2f,%.2f,"+
+		"%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f\n",
 		s.ElapsedTime, s.LapNumber, s.LapDist, s.SpeedKmh,
-		s.Throttle, s.Brake, s.Steering, s.Gear, s.RPM, s.Fuel)
+		s.Throttle, s.Brake, s.Steering, s.Gear, s.RPM, s.Fuel,
+		s.PosX, s.PosY, s.PosZ,
+		s.TyreTemp[0], s.TyreTemp[1], s.TyreTemp[2], s.TyreTemp[3],
+		s.TyreInner[0], s.TyreInner[1], s.TyreInner[2], s.TyreInner[3],
+		s.TyreCarcass[0], s.TyreCarcass[1], s.TyreCarcass[2], s.TyreCarcass[3])
 }
 
 // PitInfo buffer: the game's pit MFD state, published by the same plugin.
@@ -443,6 +562,15 @@ func DeltaAgainstBest(best []TracePoint, curDist, curElapsed float64) (float64, 
 	if len(best) < 2 || curDist < 30 {
 		return 0, false
 	}
+	// Stale-head guard: for a few samples at a line crossing, the
+	// lap counter has already incremented while the distance still
+	// reads the old lap's end — elapsed ~0 paired with ~track
+	// length. That pairing is impossible mid-lap, and without the
+	// guard the panel flashes a whole-lap-sized delta for a frame
+	// at every crossing.
+	if curElapsed < 2 && curDist > 1000 {
+		return 0, false
+	}
 	// Binary search the best lap's elapsed at curDist.
 	lo, hi := 0, len(best)-1
 	if curDist > best[hi].Dist {
@@ -542,6 +670,63 @@ var hist struct {
 	bestLap      float64
 	lastLap      float64
 	fuelPerLap   float64
+	trackLen     float64
+	// Sector deltas for the delta panel: S1/S2 latch when the splits
+	// appear during the current lap; S3 snapshots at each line crossing.
+	secS1, secS2, secS3       float64
+	secS1OK, secS2OK, secS3OK bool
+	// lapTrusted: the current lap was caught at its start (a line
+	// crossing, or tracking began at the line / in the crossing-skew
+	// zone). A lap first seen mid-way has a late-started timer and
+	// must never be adopted as reference/last/fuel data.
+	lapTrusted bool
+}
+
+// lapStartTrusted reports whether a lap that begins at this sample
+// can be timed honestly: tracking caught it at the line (LapDist
+// <= 300 m) or in the line-crossing skew zone (LapDist still reading
+// the old lap's end, >= 90% of the lap — it wraps to ~0 within a
+// sample or two, and any lap completing from there has an empty trace
+// and is rejected by the span gate anyway). A lap first seen mid-way
+// — joining a session on track, a rolling start picked up late — has
+// a timer that started late, so its "lap time" reads short: a 104.3 s
+// partial over 90% of Daytona would otherwise out-rank real 108 s
+// laps and poison the delta reference in exactly the sessions where
+// practice-style replays (garage starts) never reproduce it.
+func lapStartTrusted(s *Sample) bool {
+	if s.LapDist <= 300 {
+		return true
+	}
+	return s.TrackLength > 0 && s.LapDist >= 0.9*s.TrackLength
+}
+
+// traceCoverage returns the fraction of the lap's 100 m bins that
+// contain at least one trace point. A driven lap fills ~every bin; a
+// teleport/reset lap (the driver used reset-to-track) skips whole
+// sectors, so its endpoints span the lap while its coverage does not.
+func traceCoverage(tr []TracePoint, trackLen float64) float64 {
+	if trackLen <= 0 || len(tr) == 0 {
+		return 0
+	}
+	bins := int(math.Ceil(trackLen / 100))
+	hit := make([]bool, bins)
+	for _, p := range tr {
+		if p.Dist < 0 {
+			continue
+		}
+		b := int(p.Dist / 100)
+		if b >= bins {
+			b = bins - 1
+		}
+		hit[b] = true
+	}
+	n := 0
+	for _, h := range hit {
+		if h {
+			n++
+		}
+	}
+	return float64(n) / float64(bins)
 }
 
 func histPush(s *Sample) {
@@ -557,6 +742,8 @@ func histPush(s *Sample) {
 			hist.curTrace = hist.curTrace[:0]
 			hist.recent = hist.recent[:0]
 			hist.fuelPerLap = 0
+			hist.lapTrusted = false
+			hist.secS1OK, hist.secS2OK, hist.secS3OK = false, false, false
 		} else if diff < 0.019 {
 			return
 		}
@@ -573,32 +760,81 @@ func histPush(s *Sample) {
 	}
 	if hist.lap == 0 {
 		hist.lap, hist.lapStartET, hist.lapStartFuel = s.LapNumber, s.ElapsedTime, s.Fuel
+		hist.lapTrusted = lapStartTrusted(s)
 		return
 	}
 	if s.LapNumber < hist.lap {
 		// Lap counter went backwards (back to the garage / new run on the
 		// same clock): track fresh from this lap.
 		hist.lap, hist.lapStartET, hist.lapStartFuel = s.LapNumber, s.ElapsedTime, s.Fuel
+		hist.lapTrusted = lapStartTrusted(s)
 		hist.curTrace = hist.curTrace[:0]
+		hist.secS1OK, hist.secS2OK, hist.secS3OK = false, false, false
 		return
+	}
+	if s.TrackLength > 1000 {
+		hist.trackLen = s.TrackLength
 	}
 	if s.LapNumber > hist.lap {
 		lt := s.ElapsedTime - hist.lapStartET
-		if lt > 30 {
+		// A completed lap only counts when it was a FULL lap, verified
+		// three ways: it was TIMED from its start (lapTrusted), the
+		// trace SPANS the lap (first point at the line, last point past
+		// 95%), and the trace COVERS the lap (no teleport-sized holes —
+		// reset-to-track laps skip whole sectors while their endpoints
+		// still span the lap, and mid-lap joins can reach 95% while
+		// missing the first half-kilometre). The old reach-only check
+		// let exactly those laps through. Partials must not poison the
+		// reference lap, the last-lap time (it drives the engineer's
+		// laps-left maths), or the learned fuel-per-lap.
+		fullLap := hist.trackLen <= 0 || (hist.lapTrusted && len(hist.curTrace) > 0 &&
+			hist.curTrace[0].Dist <= 300 &&
+			hist.curTrace[len(hist.curTrace)-1].Dist >= 0.95*hist.trackLen &&
+			traceCoverage(hist.curTrace, hist.trackLen) >= 0.95)
+		if lt > 30 && fullLap {
 			hist.lastLap = lt
 		}
-		if lt > 30 && len(hist.curTrace) > 100 && (hist.bestLap == 0 || lt < hist.bestLap) {
+		if lt > 30 && len(hist.curTrace) > 100 && fullLap && (hist.bestLap == 0 || lt < hist.bestLap) {
 			hist.bestLap = lt
 			hist.bestTrace = append([]TracePoint(nil), hist.curTrace...)
 		}
-		if hist.lapStartFuel > s.Fuel+0.01 {
+		if fullLap && hist.lapStartFuel > s.Fuel+0.01 {
 			hist.fuelPerLap = hist.lapStartFuel - s.Fuel
 		}
+		// Sector 3 delta of the lap just finished: total vs best total.
+		if s.LastLap > 0 && s.BestLap > 0 {
+			hist.secS3, hist.secS3OK = s.BestLap-s.LastLap, true
+		}
+		hist.secS1OK, hist.secS2OK = false, false
 		hist.lap, hist.lapStartET, hist.lapStartFuel = s.LapNumber, s.ElapsedTime, s.Fuel
+		hist.lapTrusted = true // the new lap begins at this crossing
 		hist.curTrace = hist.curTrace[:0]
 		return
 	}
-	if len(hist.curTrace) == 0 || s.LapDist > hist.curTrace[len(hist.curTrace)-1].Dist+2 {
+	// Same lap: latch the sector deltas as their splits appear. The
+	// splits are cumulative, so each delta is "versus best at that line".
+	if !hist.secS1OK && s.CurSector1 > 0 && s.BestLapS1 > 0 {
+		hist.secS1, hist.secS1OK = s.BestLapS1-s.CurSector1, true
+	}
+	if !hist.secS2OK && s.CurSector2 > 0 && s.BestLapS2 > 0 {
+		hist.secS2, hist.secS2OK = s.BestLapS2-s.CurSector2, true
+	}
+	// Trace points for the current lap. The crossing sample is a trap:
+	// the telemetry lap counter increments AT the line while the scoring
+	// LapDist still reads the old lap's end (~track length) for a few
+	// samples. Seeding the trace with that stale point used to poison
+	// the whole lap — the monotonic rule below then rejected every real
+	// point, the finished lap had 1-2 points, failed the >100 gate, and
+	// no reference ever armed (Ari's "delta only woke up late in a
+	// stint": it armed only on crossings where the wrap won the race).
+	// So: an empty trace accepts only a start-of-lap distance (< 300 m —
+	// the wrap lands within metres of the line, sometimes negative in
+	// the pit lane); the stale tail is ignored until the wrap arrives.
+	if len(hist.curTrace) == 0 {
+		if s.LapDist < 300 {
+			hist.curTrace = append(hist.curTrace, TracePoint{Dist: s.LapDist, Elapsed: s.ElapsedTime - hist.lapStartET})
+		}
+	} else if s.LapDist > hist.curTrace[len(hist.curTrace)-1].Dist+2 {
 		hist.curTrace = append(hist.curTrace, TracePoint{Dist: s.LapDist, Elapsed: s.ElapsedTime - hist.lapStartET})
 	}
 }
@@ -625,6 +861,38 @@ func histLastLap() float64 {
 	hist.mu.Lock()
 	defer hist.mu.Unlock()
 	return hist.lastLap
+}
+
+func histBestLap() float64 {
+	hist.mu.Lock()
+	defer hist.mu.Unlock()
+	return hist.bestLap
+}
+
+// histSectors returns the latched sector deltas (current lap's S1/S2 as
+// they complete, last completed lap's S3) in the INTERNAL convention:
+// positive = AHEAD of best. The delta panel converts with deltaDisplay
+// before showing them, so what Ari reads matches LMU's own widget
+// (losing = positive/red) — see overlay.go.
+func histSectors() (s1, s2, s3 float64, ok1, ok2, ok3 bool) {
+	hist.mu.Lock()
+	defer hist.mu.Unlock()
+	return hist.secS1, hist.secS2, hist.secS3, hist.secS1OK, hist.secS2OK, hist.secS3OK
+}
+
+// estTotalLaps estimates the race's total lap count for the delta
+// panel's LAP #/# readout: exact in a lap-counted race (MaxLaps),
+// projected from the session clock and last lap time in a timed race.
+// Returns 0 when neither is knowable yet.
+func estTotalLaps(s Sample) int {
+	if s.MaxLaps >= s.LapNumber && s.MaxLaps <= 1000 {
+		return s.MaxLaps
+	}
+	last := histLastLap()
+	if s.SessionLeft > 0 && last > 20 {
+		return s.LapNumber + int(math.Ceil(s.SessionLeft/last))
+	}
+	return 0
 }
 
 func histFuelPerLap() float64 {

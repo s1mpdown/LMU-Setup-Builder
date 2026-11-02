@@ -49,6 +49,21 @@ type Engineer struct {
 
 	lastDentSum, lastDentMax int
 	flatSeen                 bool
+
+	// Default-plan fallback: whether any MFD menu data has EVER arrived
+	// this session, and whether the current quote is a default plan.
+	menuSeen  bool
+	defPlan   bool
+	defLogged bool
+
+	// Strategy calls: evaluated at lap boundaries only.
+	lastLapNum int
+	callText   string
+	callUntil  float64
+	wearPrev   [4]float64
+	wearRate   [4]float64
+	wearInit   bool
+	rainPrev   float64
 }
 
 func NewEngineer() *Engineer {
@@ -63,6 +78,11 @@ func NewEngineer() *Engineer {
 }
 
 var eng = NewEngineer()
+
+// engLogFn is wired to the app log by main() on Windows. It stays a
+// no-op elsewhere (unit tests, other platforms) and tests may swap it
+// to capture lines.
+var engLogFn = func(string) {}
 
 func dentStats(d [8]int) (sum, max int) {
 	for _, v := range d {
@@ -154,6 +174,41 @@ func (e *Engineer) clearPlan() {
 	e.tyresSet, e.repairSet = false, false
 	e.adjCats = map[string]bool{}
 	e.planActive = false
+	e.defPlan = false
+}
+
+// defaultEstimate prices a stop with NO MFD plan: the fallback for a
+// silent pit-menu feed. Fuel to add is what the rest of the race needs
+// (learned L/lap × laps remaining, less what's in the tank, capped by
+// the tank); tyres are assumed ON; repairs come from the dent count.
+func (e *Engineer) defaultEstimate(s Sample) float64 {
+	secs := 5.0 + e.bias + e.tyreSecs
+	if fpl := histFuelPerLap(); fpl > 0 {
+		lapsLeft := -1.0
+		if last := histLastLap(); s.SessionLeft > 0 && last > 20 {
+			lapsLeft = math.Ceil(s.SessionLeft / last)
+		}
+		if s.MaxLaps >= s.LapNumber && s.MaxLaps <= 1000 {
+			lapsLeft = float64(s.MaxLaps - s.LapNumber + 1)
+		}
+		if lapsLeft > 0 {
+			need := lapsLeft*fpl - s.Fuel
+			if need < 0 {
+				need = 0
+			}
+			tank := tankLitres
+			if s.FuelCapacity > 0 {
+				tank = s.FuelCapacity
+			}
+			if maxAdd := tank - s.Fuel; need > maxAdd {
+				need = maxAdd
+			}
+			secs += need / e.fillRate
+		}
+	}
+	sum, _ := dentStats(s.Dents)
+	secs += repairEstimate(sum, e.repairPerSec)
+	return secs
 }
 
 func anyFlat(s Sample) bool {
@@ -190,6 +245,8 @@ func (e *Engineer) Tick(s Sample) {
 
 	// MFD watching: fold whatever he is looking at into the pending plan.
 	if s.MenuCat != "" {
+		e.menuSeen = true
+		e.defPlan = false
 		kind := menuKind(s.MenuCat)
 		choiceOff := strings.Contains(strings.ToUpper(s.MenuChoice), "NO")
 		switch kind {
@@ -238,6 +295,166 @@ func (e *Engineer) Tick(s Sample) {
 		e.clearPlan() // the plan has been served
 	}
 	e.inPitsNow = s.PitState > 0 || s.InPits
+
+	// DEFAULT-PLAN FALLBACK. The 2026-11-02 log proved the pit-menu
+	// feed can be silent forever (the PitInfo map opens; LMU simply
+	// never delivers menu data), which used to leave the estimator
+	// mute exactly when a stop was being set up. When a stop is
+	// requested / the car is entering or in the pit lane and no MFD
+	// selection has ever arrived, quote the default plan instead.
+	// Real MFD data, if it ever comes, takes over (menuSeen above).
+	if (s.PitState >= 1 || s.InPits) && !e.menuSeen && !e.planActive && !e.stopped {
+		e.defPlan = true
+		e.predStop = e.defaultEstimate(s)
+		if !e.defLogged {
+			e.defLogged = true
+			engLogFn("engineer: pit menu silent - default-plan estimate in use")
+		}
+	}
+
+	// Strategy calls are evaluated at lap boundaries only.
+	if e.lastLapNum != 0 && s.LapNumber > e.lastLapNum {
+		e.onLapBoundary(s)
+	}
+	if s.LapNumber > 0 {
+		e.lastLapNum = s.LapNumber
+	}
+}
+
+// onLapBoundary refreshes wear/rain rates and picks the single most
+// urgent strategy call for the coming lap.
+func (e *Engineer) onLapBoundary(s Sample) {
+	if e.wearInit {
+		for i := 0; i < 4; i++ {
+			e.wearRate[i] = e.wearPrev[i] - s.TyreWear[i]
+		}
+	}
+	e.wearPrev = s.TyreWear
+	e.wearInit = true
+	call := strategyCall(e, s)
+	ttl := histLastLap()
+	if ttl < 30 {
+		ttl = 120
+	}
+	if call != "" {
+		e.callText, e.callUntil = call, s.ElapsedTime+ttl*1.2
+	} else {
+		e.callText = ""
+	}
+	e.rainPrev = s.Raining
+}
+
+// classNeighbours finds the same-class cars directly ahead of and
+// behind the player in the scoring field.
+func classNeighbours(s Sample) (ahead, behind *CarInfo) {
+	var player *CarInfo
+	for i := range s.Field {
+		if s.Field[i].IsPlayer {
+			player = &s.Field[i]
+			break
+		}
+	}
+	if player == nil {
+		return nil, nil
+	}
+	for i := range s.Field {
+		c := &s.Field[i]
+		if c.Class != player.Class || c.IsPlayer {
+			continue
+		}
+		if c.Place < player.Place && (ahead == nil || c.Place > ahead.Place) {
+			ahead = c
+		}
+		if c.Place > player.Place && (behind == nil || c.Place < behind.Place) {
+			behind = c
+		}
+	}
+	return ahead, behind
+}
+
+var cornerNames = [4]string{"FL", "FR", "RL", "RR"}
+
+// strategyCall picks at most one call for the coming lap, most urgent
+// first. Everything is arithmetic on live data — fuel maths only (the
+// feed carries no Virtual Energy), no invented numbers.
+func strategyCall(e *Engineer, s Sample) string {
+	fpl := histFuelPerLap()
+	last := histLastLap()
+	lapsLeft := -1.0
+	if s.SessionLeft > 0 && last > 20 {
+		lapsLeft = math.Ceil(s.SessionLeft / last)
+	}
+	if s.MaxLaps >= s.LapNumber && s.MaxLaps <= 1000 {
+		lapsLeft = float64(s.MaxLaps - s.LapNumber + 1)
+	}
+	ahead, behind := classNeighbours(s)
+	windowOpen := false
+	if fpl > 0 && lapsLeft > 0 {
+		windowOpen = windowStatus(s.Fuel/fpl, lapsLeft, tankLitres/fpl) == "PIT WINDOW OPEN"
+	}
+
+	// 1. Fuel: short of the flag?
+	if fpl > 0 && lapsLeft > 0 && s.Fuel/fpl < lapsLeft {
+		savePerLap := (lapsLeft - s.Fuel/fpl) * fpl / lapsLeft
+		if savePerLap <= 0.35 {
+			return fmt.Sprintf("CALL - SAVE %.1f L/LAP TO THE FLAG", savePerLap)
+		}
+		if !windowOpen {
+			return "CALL - FUEL SHORT - PLAN THE STOP"
+		}
+	}
+
+	// 2. Undercut: window open, class rival close ahead, pace parity.
+	if windowOpen && ahead != nil {
+		gap := ahead.BehindLeader - playerBehind(s)
+		if gap >= 0 && gap <= 2.0 && last > 0 && ahead.LastLap > 0 && last <= ahead.LastLap+0.3 {
+			return "CALL - BOX THIS LAP - UNDERCUT " + shortName(ahead.Driver)
+		}
+	}
+
+	// 3. Tyres: one corner wearing fast, or life too tight to the flag.
+	if e.wearInit && lapsLeft > 0 {
+		mean := (e.wearRate[0] + e.wearRate[1] + e.wearRate[2] + e.wearRate[3]) / 4
+		for i := 0; i < 4; i++ {
+			if mean > 0.002 && e.wearRate[i] > 1.6*mean {
+				return "CALL - " + cornerNames[i] + " WEARING FAST - PROTECT IT"
+			}
+			if proj := s.TyreWear[i] - e.wearRate[i]*lapsLeft; proj < 0.10 && e.wearRate[i] > 0.002 {
+				return "CALL - " + cornerNames[i] + " LIFE TIGHT - NURSE IT"
+			}
+		}
+	}
+
+	// 4. Rain trend across the last lap.
+	if s.Raining-e.rainPrev >= 0.15 || (s.Raining >= 0.5 && s.Raining > e.rainPrev) {
+		return "CALL - RAIN RISING - WETS NEXT STOP"
+	}
+
+	// 5. Overcut defence: faster class rival close behind, window open.
+	if windowOpen && behind != nil {
+		gap := playerBehind(s) - behind.BehindLeader
+		if gap >= 0 && gap <= 1.5 && last > 0 && behind.LastLap > 0 && behind.LastLap < last-0.3 {
+			return "CALL - STAY OUT - COVER " + shortName(behind.Driver)
+		}
+	}
+	return ""
+}
+
+func playerBehind(s Sample) float64 {
+	for i := range s.Field {
+		if s.Field[i].IsPlayer {
+			return s.Field[i].BehindLeader
+		}
+	}
+	return 0
+}
+
+func shortName(d string) string {
+	d = strings.TrimSpace(d)
+	if len(d) > 10 {
+		return d[:10]
+	}
+	return d
 }
 
 // Lines renders the panel: status first, then the live call, then the
@@ -253,13 +470,33 @@ func (e *Engineer) Lines(s Sample) []string {
 	if s.SessionLeft > 0 && last > 20 {
 		lapsLeft = math.Ceil(s.SessionLeft / last)
 	}
+	if s.MaxLaps >= s.LapNumber && s.MaxLaps <= 1000 {
+		lapsLeft = float64(s.MaxLaps - s.LapNumber + 1)
+	}
 	if fpl > 0 {
 		lines = append(lines, fmt.Sprintf("FUEL %.0fL - %.1f LAPS", s.Fuel, s.Fuel/fpl))
+	} else {
+		lines = append(lines, fmt.Sprintf("FUEL %.0fL - LEARNING", s.Fuel))
+	}
+	// SETTINGS — proven-live values only. Brake bias comes from the
+	// telemetry stream today (front % = (1 − rear) × 100). TC/ABS join
+	// this line only when a live feed for them exists; the physics
+	// "aid level" byte is NOT the car's TC selection and is not used.
+	if s.RearBrakeBias > 0.05 && s.RearBrakeBias < 0.95 {
+		lines = append(lines, fmt.Sprintf("BB %.1f", (1-s.RearBrakeBias)*100))
+	}
+	// WEATHER from the scoring header.
+	wx := "DRY"
+	if s.Raining > 0.35 {
+		wx = "WET"
+	} else if s.Raining > 0.05 {
+		wx = "DAMP"
+	}
+	lines = append(lines, fmt.Sprintf("WX TRK %.0f AIR %.0f %s", s.TrackTemp, s.AmbientTemp, wx))
+	if fpl > 0 {
 		if w := windowStatus(s.Fuel/fpl, lapsLeft, tankLitres/fpl); w != "" {
 			lines = append(lines, w)
 		}
-	} else {
-		lines = append(lines, fmt.Sprintf("FUEL %.0fL - LEARNING", s.Fuel))
 	}
 
 	sum, mx := dentStats(s.Dents)
@@ -271,27 +508,26 @@ func (e *Engineer) Lines(s Sample) []string {
 		case lapsLeft >= 0:
 			verdict = " - NURSE IT HOME"
 		}
-		lines = append(lines, fmt.Sprintf("DAMAGE LV%d - REPAIR ~%.0fs%s", mx, repairEstimate(sum, e.repairPerSec), verdict))
+		lines = append(lines, fmt.Sprintf("DAMAGE LV%d %.0f%% - REPAIR ~%.0fs%s",
+			mx, float64(sum)/16*100, repairEstimate(sum, e.repairPerSec), verdict))
 	}
 
 	if e.msg != "" && s.ElapsedTime <= e.msgUntil {
 		lines = append(lines, e.msg)
 	}
-
-	if s.MenuCat != "" {
-		m := fmt.Sprintf("MFD %s > %s", s.MenuCat, s.MenuChoice)
-		if len(m) > 42 {
-			m = m[:42]
-		}
-		lines = append(lines, m)
+	if e.callText != "" && s.ElapsedTime <= e.callUntil {
+		lines = append(lines, e.callText)
 	}
+
 	if e.stopped {
 		lines = append(lines, fmt.Sprintf("IN BOX %.0fs - EST %.0fs", s.ElapsedTime-e.stopStart, e.predStop))
+	} else if e.defPlan && e.predStop > 0 {
+		lines = append(lines, fmt.Sprintf("EST STOP \u2248 %.0fs - DEFAULT PLAN", e.predStop))
 	} else if e.planActive && e.predStop > 0 {
 		lines = append(lines, fmt.Sprintf("STOP EST ~%.0fs", e.predStop))
 	}
-	if len(lines) > 5 {
-		lines = lines[:5]
+	if len(lines) > 8 {
+		lines = lines[:8]
 	}
 	return lines
 }
