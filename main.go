@@ -695,7 +695,7 @@ func main() {
 				Children: []Widget{
 					Label{Text: "Created by Ari —", TextColor: muted},
 					LinkLabel{
-						Text: `<a href="https://www.twitch.tv/ariazuhdi">Twitch · ariazuhdi</a>  ·  <a href="https://www.youtube.com/@ariazuhdi">YouTube · ariazuhdi</a>  ·  <a href="https://www.tiktok.com/@412i_">TikTok · 412i_</a>`,
+						Text: `<a href="https://www.twitch.tv/ariazuhdi">Twitch · ariazuhdi</a>  ·  <a href="https://www.youtube.com/@Ari.Azuhdi">YouTube · Ari.Azuhdi</a>  ·  <a href="https://www.tiktok.com/@412i_">TikTok · 412i_</a>`,
 						OnLinkActivated: func(link *walk.LinkLabelLink) {
 							exec.Command("rundll32", "url.dll,FileProtocolHandler", link.URL()).Start()
 						},
