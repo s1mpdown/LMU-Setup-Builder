@@ -40,6 +40,15 @@ var trackTable = []TrackInfo{
 	{"Portimao", 4.65, 3, 3},
 	{"Fuji", 4.56, 2, 3},
 	{"Interlagos", 4.31, 2, 3},
+	// US Track Pass tracks (LMU "on Tour"): Pack 1 (game v1.4, 28 Jul 2026)
+	// added Laguna Seca; Pack 2 (v1.4.2, 22 Sep 2026) added Road Atlanta
+	// and Long Beach. Lengths are the real circuits' (3.602 / 4.088 /
+	// 3.167 km). WingQ/WingR are STARTING POINTS only — mid-high for
+	// Laguna, mid for Road Atlanta, high for the Long Beach street
+	// circuit — uncalibrated until Ari runs them; see 1.4 recap.
+	{"Laguna Seca", 3.602, 2, 3},
+	{"Road Atlanta", 4.088, 2, 2},
+	{"Long Beach", 3.167, 3, 3},
 }
 
 var defaultTrack = TrackInfo{"Unknown track", 5.70, 2, 2}
@@ -84,6 +93,12 @@ func lookupTrack(folder string) TrackInfo {
 		return trackTable[11]
 	case strings.Contains(f, "interlagos") || strings.Contains(f, "paulo"):
 		return trackTable[12]
+	case strings.Contains(f, "laguna") || strings.Contains(f, "seca"):
+		return trackTable[13]
+	case strings.Contains(f, "road atlanta") || strings.Contains(f, "atlanta"):
+		return trackTable[14]
+	case strings.Contains(f, "long beach") || strings.Contains(f, "longbeach") || strings.Contains(f, "long_beach"):
+		return trackTable[15]
 	}
 	if t, ok := match(); ok {
 		return t

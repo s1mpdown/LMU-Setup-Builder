@@ -76,6 +76,41 @@ func TestFeel(t *testing.T) {
 	}
 }
 
+// US Track Pass tracks (Ari's catch, 2026-11-05): Laguna Seca arrived
+// with game v1.4 (28 Jul 2026), Road Atlanta + Long Beach with v1.4.2
+// (22 Sep 2026). They must resolve to their own lengths and starting
+// wing values, not fall through to the 5.70 km generic default.
+func TestUSTracksLookup(t *testing.T) {
+	cases := []struct {
+		folder string
+		km     float64
+		wingQ  int
+		wingR  int
+	}{
+		{"LagunaSeca", 3.602, 2, 3},
+		{"RoadAtlanta", 4.088, 2, 2},
+		{"LongBeach", 3.167, 3, 3},
+	}
+	for _, c := range cases {
+		tr := lookupTrack(c.folder)
+		if tr.Name == "Unknown track" || !approx(tr.Km, c.km, 0.001) {
+			t.Errorf("lookupTrack(%q) = %q %.3f km, want %.3f km", c.folder, tr.Name, tr.Km, c.km)
+		}
+		if tr.WingQ != c.wingQ || tr.WingR != c.wingR {
+			t.Errorf("lookupTrack(%q) wings Q/R = %d/%d, want %d/%d", c.folder, tr.WingQ, tr.WingR, c.wingQ, c.wingR)
+		}
+		// Lexus WingBase is 0, so the plan wing is the track wing itself.
+		q := lexusPlan(tr, Session{Kind: "quali", VECap: 100}, "Balanced")
+		r := lexusPlan(tr, Session{Kind: "race30", Minutes: 30, VECap: 100}, "Balanced")
+		if q.Wing != c.wingQ || r.Wing != c.wingR {
+			t.Errorf("%s plan wings quali/race = %d/%d, want %d/%d", tr.Name, q.Wing, r.Wing, c.wingQ, c.wingR)
+		}
+	}
+	if len(trackTable) != 16 {
+		t.Errorf("trackTable has %d tracks, want 16", len(trackTable))
+	}
+}
+
 func TestBasePerLap(t *testing.T) {
 	lines := []string{`FuelCapacitySetting=0//18.0L (5.3 laps)`}
 	v, ok := basePerLapLitres(lines)
