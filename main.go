@@ -363,6 +363,9 @@ func generate() {
 		return
 	}
 	summary = append(summary, "", "Written to:", dest, "", "It's in the garage setup list at "+trackFolder+" now.")
+	if moved := replaceOlderSetups(dest); len(moved) > 0 {
+		summary = append(summary, "", "Replaced older "+kindName+" setup(s) on this track (moved to JettBackups):", strings.Join(moved, ", "))
+	}
 	say(summary...)
 }
 
